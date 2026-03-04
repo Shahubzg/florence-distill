@@ -1,0 +1,14 @@
+torch
+torchvision
+torchaudio
+transformers
+accelerate
+datasets
+tqdm
+numpy
+pyyaml
+pycocoevalcap
+fiftyone
+einops
+timm
+ipywidgets

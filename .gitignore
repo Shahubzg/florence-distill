@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+
+env/
+.venv/
+
+logs/
+runs/
+outputs/
+checkpoints/
+
+data/
+
+.cache/
+wandb/
