@@ -7,8 +7,5 @@ datasets
 tqdm
 numpy
 pyyaml
-pycocoevalcap
-fiftyone
 einops
 timm
-ipywidgets
