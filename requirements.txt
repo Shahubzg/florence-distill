@@ -9,3 +9,4 @@ numpy
 pyyaml
 einops
 timm
+matplotlib
