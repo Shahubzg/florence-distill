@@ -1,18 +1,20 @@
 #!/bin/bash
-#SBATCH --job-name=debug
+#SBATCH --job-name=florence_baseline
 #SBATCH --partition=boost_usr_prod
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
-#SBATCH --time=00:30:00
-#SBATCH --output=../logs/%x_%j.out
-#SBATCH --error=../logs/%x_%j.err
+#SBATCH --time=01:00:00
+#SBATCH --output=/leonardo_work/IscrC_DEMOLLM/florence_distill/logs/%x_%j.out
+#SBATCH --error=/leonardo_work/IscrC_DEMOLLM/florence_distill/logs/%x_%j.err
 
-module purge
 module load profile/deeplrn
 module load python/3.11.7
-module load cuda/12.2
 
-source ../env/venv/bin/activate
+source /leonardo_work/IscrC_DEMOLLM/florence_distill/env/venv/bin/activate
 
-python ../repo/src/train.py
+cd /leonardo_work/IscrC_DEMOLLM/florence_distill/repo
+
+bash scripts/run_baseline.sh
