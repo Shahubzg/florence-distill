@@ -2,9 +2,9 @@
 
 set -e
 
-IMAGE_ROOT="/leonardo_work/IscrC_DEMOLLM/florence_distill/data/coco_val500/images"
-CAPTIONS_JSON="/leonardo_work/IscrC_DEMOLLM/florence_distill/data/coco_val500/captions_val500.json"
-OUTPUT_DIR="/leonardo_work/IscrC_DEMOLLM/florence_distill/outputs/week2_baseline"
+IMAGE_ROOT="/leonardo_work/IscrC_DEMOLLM/florence_distill/data/coco/val2017"
+CAPTIONS_JSON="/leonardo_work/IscrC_DEMOLLM/florence_distill/data/coco/annotations/captions_val2017.json"
+OUTPUT_DIR="/leonardo_work/IscrC_DEMOLLM/florence_distill/outputs/results_baseline"
 
 python src/teacher_baseline.py \
   --image_root ${IMAGE_ROOT} \
