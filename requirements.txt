@@ -1,11 +1,12 @@
 torch
 torchvision
 torchaudio
-transformers
+transformers==4.49.0
 accelerate
 datasets
 tqdm
 numpy
+pandas
 pyyaml
 einops
 timm

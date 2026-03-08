@@ -7,13 +7,16 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=01:00:00
-#SBATCH --output=../logs/%x_%j.out
-#SBATCH --error=../logs/%x_%j.err
+#SBATCH --output=/leonardo_work/IscrC_DEMOLLM/florence_distill/logs/%x_%j.out
+#SBATCH --error=/leonardo_work/IscrC_DEMOLLM/florence_distill/logs/%x_%j.err
 
 module load profile/deeplrn
 module load python/3.11.7
 
 source /leonardo_work/IscrC_DEMOLLM/florence_distill/env/venv/bin/activate
+
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
 
 cd /leonardo_work/IscrC_DEMOLLM/florence_distill/repo
 
