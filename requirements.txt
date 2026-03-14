@@ -11,3 +11,9 @@ pyyaml
 einops
 timm
 matplotlib
+# ONNX export & verification
+onnx
+onnxruntime
+# TFLite conversion (optional; install separately on cluster)
+# onnx-tf
+# tensorflow
