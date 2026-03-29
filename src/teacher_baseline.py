@@ -130,18 +130,31 @@ def load_coco_subset(
     num_samples: int,
     seed: int,
     instances_data: Optional[Dict[int, Dict]] = None,
+    collect_all_captions: bool = False,
 ) -> List[Dict]:
+    """Load COCO image-caption pairs.
+
+    Args:
+        num_samples: Number of samples to return. 0 = use all.
+        collect_all_captions: If True, collect all captions per image into
+            an "all_captions" list field. The "caption" field still holds one
+            caption (the first encountered).
+    """
     with captions_json.open("r", encoding="utf-8") as f:
         coco = json.load(f)
 
     image_id_to_file = {img["id"]: img["file_name"] for img in coco["images"]}
 
-    seen: set = set()
-    pairs: List[Dict] = []
+    # First pass: collect all captions per image
+    image_captions: Dict[int, List[str]] = {}
     for ann in coco["annotations"]:
         image_id = ann["image_id"]
-        if image_id in seen:
-            continue
+        if image_id not in image_captions:
+            image_captions[image_id] = []
+        image_captions[image_id].append(ann["caption"].strip())
+
+    pairs: List[Dict] = []
+    for image_id, captions in image_captions.items():
         file_name = image_id_to_file.get(image_id)
         if file_name is None:
             continue
@@ -153,20 +166,24 @@ def load_coco_subset(
             "image_id": image_id,
             "file_name": file_name,
             "image_path": str(image_path),
-            "caption": ann["caption"].strip(),
+            "caption": captions[0],
             "bbox_prompts": [],
         }
+
+        if collect_all_captions:
+            entry["all_captions"] = captions
 
         if instances_data is not None and image_id in instances_data:
             inst = instances_data[image_id]
             entry["bbox_prompts"] = build_bbox_prompts(inst["bboxes"], inst["classes"])
 
         pairs.append(entry)
-        seen.add(image_id)
 
     rng = random.Random(seed)
     rng.shuffle(pairs)
-    return pairs[:num_samples]
+    if num_samples > 0:
+        pairs = pairs[:num_samples]
+    return pairs
 
 
 # ---------------------------------------------------------------------------

@@ -2,18 +2,18 @@
 """
 export_student_tflite.py
 
-Export the TinyCLIP-style student to ONNX and (optionally) TFLite.
+Thesis-aligned PyTorch -> TFLite exporter for the distilled student model.
 
-Pipeline:
-  1. Build student (vision encoder + frozen Florence-2 token embedding)
-  2. Export to ONNX using torch.onnx.export  (always runs)
-  3. Verify ONNX output with onnxruntime  (always runs if onnxruntime is available)
-  4. Convert ONNX → TFLite via onnx-tf + tensorflow  (runs if both installed)
+Required conversion strategy:
+  1) Try direct conversion with litert-torch.
+  2) If direct path fails, fallback to:
+       PyTorch -> ONNX -> TensorFlow SavedModel -> TFLite
 
-Usage on Leonardo:
-    python export_student_tflite.py --teacher_model_id /path/to/florence-2-base
+Verification:
+  - Always verifies ONNX output against PyTorch (if onnxruntime is installed).
+  - Optionally runs a smoke test on the produced .tflite file.
 
-The script is designed to run without GPU; CPU is sufficient for export.
+This script is intended to run locally on your laptop.
 """
 
 from __future__ import annotations
@@ -35,12 +35,32 @@ from student_model import (
     TinyCLIPStudent,
     StudentConfig,
     build_student_with_florence_embeddings,
+    build_student_reduced_vocab,
+    extract_deployment_model,
+    count_deployment_params,
 )
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+
+def _freeze_module_parameters(module: torch.nn.Module) -> None:
+    for param in module.parameters():
+        param.requires_grad = False
+
+
+def _make_example_inputs(
+    height: int,
+    width: int,
+    seq_len: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        torch.randn(1, 3, height, width, device=device),
+        torch.zeros(1, seq_len, dtype=torch.long, device=device),
+    )
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
@@ -59,7 +79,24 @@ def parse_args() -> argparse.Namespace:
                    help="ONNX opset version (>=12 required; 14 recommended).")
     p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--skip_tflite", action="store_true",
-                   help="Skip TFLite conversion even if tensorflow/onnx-tf are available.")
+                   help="Skip TFLite conversion even if conversion deps are available.")
+    p.add_argument("--skip_direct_litert", action="store_true",
+                   help="Skip direct litert-torch path and use fallback pipeline.")
+    # Architecture options
+    p.add_argument("--backbone", type=str, default="resnet18",
+                   choices=["resnet18", "mobilenetv2", "custom_tiny"])
+    p.add_argument("--vocab_mapping", type=str, default=None,
+                   help="Path to vocab_mapping_*.json for reduced vocab export.")
+    p.add_argument("--d_model", type=int, default=256)
+    p.add_argument("--n_heads", type=int, default=4)
+    p.add_argument("--n_layers", type=int, default=2)
+    # Quantization
+    p.add_argument("--quantize_int8", action="store_true",
+                   help="Apply INT8 post-training quantization to TFLite model.")
+    p.add_argument("--calibration_images", type=str, default=None,
+                   help="Directory of calibration images for INT8 quantization.")
+    p.add_argument("--n_calibration", type=int, default=100,
+                   help="Number of calibration samples for INT8 quantization.")
     return p.parse_args()
 
 
@@ -73,30 +110,44 @@ def build_student(
     processor,
     checkpoint: str | None,
     device: torch.device,
+    backbone: str = "resnet18",
+    vocab_mapping: str | None = None,
+    d_model: int = 256,
+    n_heads: int = 4,
+    n_layers: int = 2,
 ) -> TinyCLIPStudent:
     teacher = AutoModelForCausalLM.from_pretrained(
         teacher_model_id, trust_remote_code=True,
     )
     teacher.eval()
-    for p in teacher.parameters():
-        p.requires_grad = False
+    _freeze_module_parameters(teacher)
 
     vocab_size = processor.tokenizer.vocab_size or len(processor.tokenizer)
     cfg = StudentConfig(
         vocab_size=vocab_size,
-        d_model=256,
-        n_heads=4,
-        n_layers=2,
+        d_model=d_model,
+        n_heads=n_heads,
+        n_layers=n_layers,
         max_seq_len=seq_len,
-        vision_out_dim=256,
+        vision_out_dim=d_model,
+        backbone=backbone,
     )
-    student = build_student_with_florence_embeddings(teacher, config=cfg)
+
+    if vocab_mapping:
+        print(f"Building student with reduced vocabulary from {vocab_mapping} ...")
+        student = build_student_reduced_vocab(cfg, vocab_mapping, florence_model=teacher)
+    else:
+        student = build_student_with_florence_embeddings(teacher, config=cfg)
 
     if checkpoint:
         ckpt_data = torch.load(checkpoint, map_location="cpu")
         state = ckpt_data.get("student_state_dict", ckpt_data)
         student.load_state_dict(state, strict=False)
         print(f"Loaded checkpoint: {checkpoint}")
+
+    # Extract deployment-only model (strip text encoder if present)
+    student = extract_deployment_model(student)
+    print(f"Deployment model params: {count_deployment_params(student)}")
 
     student.to(device)
     student.eval()
@@ -116,8 +167,7 @@ def export_onnx(
     opset: int,
 ) -> None:
     device = next(student.parameters()).device
-    dummy_images = torch.randn(1, 3, height, width, device=device)
-    dummy_ids = torch.zeros(1, seq_len, dtype=torch.long, device=device)
+    dummy_images, dummy_ids = _make_example_inputs(height, width, seq_len, device)
 
     onnx_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -137,6 +187,51 @@ def export_onnx(
             do_constant_folding=True,
         )
     print(f"[ONNX] Exported to {onnx_path}")
+
+
+def convert_direct_litert(
+    student: TinyCLIPStudent,
+    tflite_path: Path,
+    height: int,
+    width: int,
+    seq_len: int,
+) -> tuple[bool, str]:
+    """
+    Direct PyTorch -> TFLite conversion using litert-torch.
+    Returns (success, message).
+    """
+    try:
+        import litert_torch  # type: ignore
+    except Exception as exc:
+        # Some environments fail during import due to torch/torchao ABI/version
+        # mismatch (e.g. missing torch.int1). We treat any import-time failure as
+        # a non-fatal direct-path miss and fall back to ONNX->TF->TFLite.
+        return False, f"litert-torch import failed: {exc}"
+
+    device = next(student.parameters()).device
+    example_inputs = _make_example_inputs(height, width, seq_len, device)
+
+    try:
+        exported = torch.export.export(student, example_inputs)
+    except Exception as exc:
+        return False, f"torch.export failed: {exc}"
+
+    try:
+        if hasattr(litert_torch, "convert") and hasattr(litert_torch.convert, "to_tflite"):
+            tflite_bytes = litert_torch.convert.to_tflite(exported)
+        elif hasattr(litert_torch, "to_tflite"):
+            tflite_bytes = litert_torch.to_tflite(exported)
+        else:
+            return False, "Unsupported litert-torch API (no to_tflite entrypoint found)"
+
+        if not isinstance(tflite_bytes, (bytes, bytearray)):
+            return False, "litert-torch returned non-bytes payload"
+
+        tflite_path.write_bytes(tflite_bytes)
+        size_mb = tflite_path.stat().st_size / (1024 ** 2)
+        return True, f"direct conversion succeeded ({size_mb:.2f} MB)"
+    except Exception as exc:
+        return False, f"litert-torch conversion failed: {exc}"
 
 
 # ---------------------------------------------------------------------------
@@ -164,11 +259,12 @@ def verify_onnx(
     ort_out = sess.run(["logits"], {"images": dummy_images, "input_ids": dummy_ids})[0]
 
     # Compare with PyTorch
+    device = next(student.parameters()).device
     with torch.no_grad():
         pt_out = student(
-            torch.from_numpy(dummy_images),
-            torch.from_numpy(dummy_ids),
-        ).numpy()
+            torch.from_numpy(dummy_images).to(device),
+            torch.from_numpy(dummy_ids).to(device),
+        ).cpu().numpy()
 
     max_diff = float(np.abs(ort_out - pt_out).max())
     print(f"[ONNX verify] Max abs diff (ORT vs PyTorch): {max_diff:.6f}")
@@ -184,10 +280,45 @@ def verify_onnx(
 # Step 4: ONNX → TFLite conversion
 # ---------------------------------------------------------------------------
 
+def _make_representative_dataset(
+    calibration_dir: str | None,
+    height: int,
+    width: int,
+    seq_len: int,
+    n_samples: int = 100,
+):
+    """Generator for INT8 calibration data."""
+    import glob
+
+    def representative_dataset():
+        if calibration_dir:
+            from PIL import Image as PILImage
+            image_files = sorted(glob.glob(f"{calibration_dir}/*.jpg"))[:n_samples]
+            for img_path in image_files:
+                img = PILImage.open(img_path).convert("RGB").resize((width, height))
+                img_array = np.array(img, dtype=np.float32) / 255.0
+                img_tensor = np.transpose(img_array, (2, 0, 1))[np.newaxis, ...]
+                ids = np.zeros((1, seq_len), dtype=np.int64)
+                yield [img_tensor.astype(np.float32), ids]
+        else:
+            for _ in range(min(n_samples, 50)):
+                img = np.random.randn(1, 3, height, width).astype(np.float32)
+                ids = np.zeros((1, seq_len), dtype=np.int64)
+                yield [img, ids]
+
+    return representative_dataset
+
+
 def convert_onnx_to_tflite(
     onnx_path: Path,
     tflite_path: Path,
     output_dir: Path,
+    quantize_int8: bool = False,
+    calibration_dir: str | None = None,
+    height: int = 224,
+    width: int = 224,
+    seq_len: int = 64,
+    n_calibration: int = 100,
 ) -> bool:
     """Returns True if conversion succeeded."""
     # Check dependencies
@@ -226,15 +357,63 @@ def convert_onnx_to_tflite(
     print("[TFLite] Converting TF SavedModel → TFLite ...")
     converter = tf.lite.TFLiteConverter.from_saved_model(str(tf_saved_path))
 
-    # FP16 quantization: reduces model size by ~2× with minimal accuracy loss
-    converter.optimizations = [tf.lite.Optimize.DEFAULT]
-    converter.target_spec.supported_types = [tf.float16]
+    if quantize_int8:
+        print("[TFLite] Applying INT8 post-training quantization ...")
+        converter.optimizations = [tf.lite.Optimize.DEFAULT]
+        converter.representative_dataset = _make_representative_dataset(
+            calibration_dir, height, width, seq_len, n_calibration
+        )
+        converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+        converter.inference_input_type = tf.int8
+        converter.inference_output_type = tf.int8
+    else:
+        # FP16 quantization: reduces model size by ~2× with minimal accuracy loss
+        converter.optimizations = [tf.lite.Optimize.DEFAULT]
+        converter.target_spec.supported_types = [tf.float16]
 
     tflite_model = converter.convert()
     tflite_path.write_bytes(tflite_model)
     size_mb = tflite_path.stat().st_size / (1024 ** 2)
-    print(f"[TFLite] Saved to {tflite_path}  ({size_mb:.2f} MB)")
+    quant_type = "INT8" if quantize_int8 else "FP16"
+    print(f"[TFLite] Saved to {tflite_path}  ({size_mb:.2f} MB, {quant_type})")
     return True
+
+
+def smoke_test_tflite(
+    tflite_path: Path,
+    height: int,
+    width: int,
+    seq_len: int,
+) -> tuple[bool, str]:
+    """
+    Basic execution smoke test of a produced TFLite model.
+    Returns (success, message).
+    """
+    try:
+        import tensorflow as tf
+    except ImportError:
+        return False, "tensorflow not installed (cannot run TFLite smoke test)"
+
+    try:
+        interpreter = tf.lite.Interpreter(model_path=str(tflite_path))
+        interpreter.allocate_tensors()
+        input_details = interpreter.get_input_details()
+        output_details = interpreter.get_output_details()
+
+        if len(input_details) < 2:
+            return False, f"unexpected input count: {len(input_details)}"
+
+        # Build dummy inputs matching interpreter dtypes
+        img = np.random.randn(1, 3, height, width).astype(input_details[0]["dtype"])
+        ids = np.zeros((1, seq_len), dtype=input_details[1]["dtype"])
+
+        interpreter.set_tensor(input_details[0]["index"], img)
+        interpreter.set_tensor(input_details[1]["index"], ids)
+        interpreter.invoke()
+        out = interpreter.get_tensor(output_details[0]["index"])
+        return True, f"invoke OK, output shape={tuple(out.shape)}"
+    except Exception as exc:
+        return False, f"TFLite invoke failed: {exc}"
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +433,12 @@ def main() -> None:
 
     print("Building student model ...")
     student = build_student(
-        args.teacher_model_id, args.seq_len, processor, args.checkpoint, device
+        args.teacher_model_id, args.seq_len, processor, args.checkpoint, device,
+        backbone=args.backbone,
+        vocab_mapping=args.vocab_mapping,
+        d_model=args.d_model,
+        n_heads=args.n_heads,
+        n_layers=args.n_layers,
     )
 
     n_total = sum(p.numel() for p in student.parameters())
@@ -267,11 +451,50 @@ def main() -> None:
     # Step 3: ONNX verification
     onnx_ok = verify_onnx(onnx_path, args.height, args.width, args.seq_len, student)
 
-    # Step 4: TFLite
+    # Step 4: TFLite conversion according to thesis:
+    #         direct litert-torch first, fallback ONNX->TF->TFLite.
     tflite_ok = False
+    tflite_path = out_dir / args.tflite_name
+    tflite_route = None
+    tflite_message = ""
+    tflite_smoke_ok = False
+    tflite_smoke_msg = ""
+
     if not args.skip_tflite:
-        tflite_path = out_dir / args.tflite_name
-        tflite_ok = convert_onnx_to_tflite(onnx_path, tflite_path, out_dir)
+        if not args.skip_direct_litert:
+            ok_direct, msg_direct = convert_direct_litert(
+                student, tflite_path, args.height, args.width, args.seq_len
+            )
+            print(f"[TFLite][direct] {msg_direct}")
+            if ok_direct:
+                tflite_ok = True
+                tflite_route = "litert-torch"
+                tflite_message = msg_direct
+            else:
+                print("[TFLite] Falling back to ONNX -> TF -> TFLite ...")
+
+        if not tflite_ok:
+            ok_fallback = convert_onnx_to_tflite(
+                onnx_path, tflite_path, out_dir,
+                quantize_int8=args.quantize_int8,
+                calibration_dir=args.calibration_images,
+                height=args.height,
+                width=args.width,
+                seq_len=args.seq_len,
+                n_calibration=args.n_calibration,
+            )
+            tflite_ok = ok_fallback
+            if ok_fallback:
+                tflite_route = "onnx-tf-tflite"
+                tflite_message = "fallback conversion succeeded"
+            else:
+                tflite_message = "fallback conversion failed"
+
+        if tflite_ok:
+            tflite_smoke_ok, tflite_smoke_msg = smoke_test_tflite(
+                tflite_path, args.height, args.width, args.seq_len
+            )
+            print(f"[TFLite][smoke] {tflite_smoke_msg}")
     else:
         print("[TFLite] Skipped (--skip_tflite).")
 
@@ -282,6 +505,10 @@ def main() -> None:
         "onnx_verified": onnx_ok,
         "tflite_path": str(out_dir / args.tflite_name) if tflite_ok else None,
         "tflite_converted": tflite_ok,
+        "tflite_route": tflite_route,
+        "tflite_message": tflite_message,
+        "tflite_smoke_test_ok": tflite_smoke_ok,
+        "tflite_smoke_test_message": tflite_smoke_msg,
         "student_params": n_total,
         "student_size_fp32_mb": round(n_total * 4 / 1024 ** 2, 2),
         "height": args.height,
